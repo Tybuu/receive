@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 rayon = { version = "1.10" }
 ndarray = {version = "0.16.1", features = ["rayon"]}
+rustfft = "*"
 once_cell = "*"
 plotly = "0.8"
+rtlsdr = "*"
