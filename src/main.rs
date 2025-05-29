@@ -10,8 +10,8 @@ use std::{
 };
 
 use ndarray::{
-    Array, Array1, Array2, ArrayBase, ArrayView1, Axis, Zip, array, azip, concatenate, linspace, s,
-    stack,
+    Array, Array1, Array2, ArrayBase, ArrayView1, AssignElem, Axis, Zip, array, azip, concatenate,
+    linspace, s, stack,
 };
 use once_cell::sync::Lazy;
 use plotly::{Layout, Plot, Scatter};
@@ -28,13 +28,13 @@ use uinput::event::keyboard::Key;
 // RTL Settings
 const FSPS: u64 = 2 * 256 * 256 * 16; // about 2Msps...works
 const FC: u32 = 250_000_000;
-const TMAX: f64 = 122.076e-6 * 80.0;
+const TMAX: f64 = 122.076e-6 * 20.0;
 const NYQ: f64 = (FSPS / 2) as f64;
 
 // Backscatter Settings
 const FREQ_LOW: f64 = 50e3;
 const FREQ_HIGH: f64 = 100e3;
-const BIT_TIME: f64 = 500e-6;
+const BIT_TIME: f64 = 65e-6;
 
 const BORDER: f64 = FREQ_LOW + (FREQ_HIGH - FREQ_LOW) / 2.0;
 
@@ -95,7 +95,7 @@ fn main() {
 
         let buffer_size = prev_buffer.len() + n;
         let fft_size = prev_buffer.len() + n + 456;
-        let mut buffer: Array1<Complex64> = Array1::zeros(buffer_size);
+        let mut buffer: Array1<Complex64> = Array1::zeros(fft_size);
         let mut abs_buffer: Array1<f64> = Array1::zeros(buffer_size);
         let mut theta_clone: Array1<f64> = Array1::zeros(buffer_size);
         let mut theta_x: Array1<f64> = Array1::zeros(buffer_size);
@@ -108,11 +108,11 @@ fn main() {
         );
 
         let prev_buffer_size = prev_buffer.len();
-        let bandpass = bandpass(buffer_size);
+        let bandpass = bandpass(fft_size);
 
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(buffer_size);
-        let ifft = planner.plan_fft_inverse(buffer_size);
+        let fft = planner.plan_fft_forward(fft_size);
+        let ifft = planner.plan_fft_inverse(fft_size);
         let mut fft_scratch = vec![Complex64::ZERO; fft.get_inplace_scratch_len()];
         let mut ifft_scratch = vec![Complex64::ZERO; ifft.get_inplace_scratch_len()];
 
@@ -127,6 +127,9 @@ fn main() {
             buffer
                 .slice_mut(s![prev_buffer.len()..buffer_size])
                 .assign(&samples);
+            buffer
+                .slice_mut(s![buffer_size..])
+                .mapv_inplace(|_| Complex64::zero());
 
             // Apply fft to buffer
             fft.process_with_scratch(buffer.as_slice_mut().unwrap(), &mut fft_scratch);
@@ -141,21 +144,24 @@ fn main() {
             buffer.mapv_inplace(|x| x / buffer_size as f64);
             let fft_time = Instant::now();
 
+            let mut data_buffer = buffer.slice_mut(s![..buffer_size]);
             // Squelch our data
             Zip::from(&mut abs_buffer)
-                .and(&buffer)
+                .and(&data_buffer)
                 .for_each(|x, y| *x = y.abs());
             let threshold = abs_buffer.mean().unwrap_or_default() / 3.0;
-            Zip::from(&mut buffer).and(&abs_buffer).for_each(|x, y| {
-                if *y < threshold {
-                    *x = Complex64::zero();
-                }
-            });
+            Zip::from(&mut data_buffer)
+                .and(&abs_buffer)
+                .for_each(|x, y| {
+                    if *y < threshold {
+                        *x = Complex64::zero();
+                    }
+                });
 
             // Find the derivative
             Zip::from(theta_buffer.slice_mut(s![1..]))
-                .and(buffer.slice(s![..-1]))
-                .and(buffer.slice(s![1..]))
+                .and(data_buffer.slice(s![..-1]))
+                .and(data_buffer.slice(s![1..]))
                 .par_for_each(|x, y, z| {
                     let left_theta = y.arg();
                     let right_theta = z.arg();
@@ -195,20 +201,14 @@ fn main() {
                 .map(|i| {
                     let samples = theta_buffer.slice(s![i..i + REF_FREQ.len()]);
                     let score = ncc(&samples, &REF_FREQ.view());
+                    // println!("Score: {}", score);
                     (i, score)
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
                 .unwrap();
             let ncc_time = Instant::now();
             // Process the packet if the socre is higher than the threshold
-            // println!(
-            //     "FFT: {} | Filter: {} | ncc: {} | Total: {}",
-            //     (fft_time - start).as_micros(),
-            //     (filter_time - fft_time).as_micros(),
-            //     (ncc_time - filter_time).as_micros(),
-            //     (ncc_time - start).as_micros(),
-            // );
-            if res.1 > 0.90 {
+            if res.1 > 0.70 {
                 // If our last bit is within the next samples previous buffer, we want to skip it
                 // as it could influence the correlation score. We won't miss any packets either as
                 // the backscatter device has a packet time worth delay between each packet
@@ -228,6 +228,13 @@ fn main() {
                         });
                 }
 
+                println!(
+                    "FFT: {} | Filter: {} | ncc: {} | Total: {}",
+                    (fft_time - start).as_micros(),
+                    (filter_time - fft_time).as_micros(),
+                    (ncc_time - filter_time).as_micros(),
+                    (ncc_time - start).as_micros(),
+                );
                 // Threshold the bit buckets themselves to transform the bucket to either 1 or 0 by
                 // choosing the larger bit value
                 let mut bits = bits.sum_axis(Axis(1));
@@ -243,7 +250,7 @@ fn main() {
             } else {
                 overlap = false;
             }
-            prev_buffer.assign(&samples.slice(s![-(prev_buffer.len() as i32)..]));
+            prev_buffer.assign(&samples.slice(s![(samples.len() - prev_buffer_size)..]));
         }
     });
 
@@ -280,7 +287,7 @@ fn bandpass(num: usize) -> Array1<Complex64> {
     freqs
         .into_iter()
         .map(|x| {
-            if x >= FREQ_LOW - 20e3 && x <= FREQ_HIGH + 20e3 {
+            if x >= FREQ_LOW - 10e3 && x <= FREQ_HIGH + 10e3 {
                 Complex64::new(1.0, 0.0)
             } else {
                 Complex64::zero()
@@ -291,7 +298,11 @@ fn bandpass(num: usize) -> Array1<Complex64> {
 
 #[inline]
 fn ncc(va: &ArrayView1<f64>, vb: &ArrayView1<f64>) -> f64 {
-    return (va.dot(vb) / (va.dot(va) * vb.dot(vb)).sqrt()).abs();
+    let a_m = va.mean().unwrap();
+    let va_m = va.mapv(|x| x - a_m);
+    let b_m = vb.mean().unwrap();
+    let vb_m = vb.mapv(|x| x - b_m);
+    return ((va_m).dot(&vb_m) / (va_m.dot(&va_m) * vb_m.dot(&vb_m)).sqrt()).abs();
 }
 
 fn read_samples(n: usize, sdr: &mut RTLSDRDevice) -> Array1<Complex64> {
