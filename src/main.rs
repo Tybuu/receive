@@ -32,8 +32,8 @@ const TMAX: f64 = BIT_TIME * 26.0;
 const NYQ: f64 = (FSPS / 2) as f64;
 
 // Backscatter Settings
-const FREQ_LOW: f64 = 100e3;
-const FREQ_HIGH: f64 = 200e3;
+const FREQ_LOW: f64 = 400e3;
+const FREQ_HIGH: f64 = 600e3;
 const BIT_TIME: f64 = 100e-6;
 
 const BORDER: f64 = FREQ_LOW + (FREQ_HIGH - FREQ_LOW) / 2.0;
@@ -63,7 +63,7 @@ fn main() {
     let n = (FSPS as f64 * TMAX).floor() as usize;
     let n = (n as usize / 256) * 256;
     let (samples_tx, samples_rx) = mpsc::channel();
-    // let (states_tx, states_rx) = mpsc::channel();
+    let (states_tx, states_rx) = mpsc::channel();
 
     let rtl_handle = std::thread::spawn(move || {
         let mut sdr = rtlsdr::open(0).unwrap();
@@ -208,7 +208,7 @@ fn main() {
                 .unwrap();
             let ncc_time = Instant::now();
             // Process the packet if the socre is higher than the threshold
-            if res.1 > 0.50 {
+            if res.1 > 0.40 {
                 // If our last bit is within the next samples previous buffer, we want to skip it
                 // as it could influence the correlation score. We won't miss any packets either as
                 // the backscatter device has a packet time worth delay between each packet
@@ -246,7 +246,7 @@ fn main() {
                     .sum_axis(Axis(1))
                     .mapv(|x| if x >= 2 { 1u32 } else { 0 });
                 println!(" | Bits: {}", states);
-                // states_tx.send(states).unwrap();
+                states_tx.send(states).unwrap();
             } else {
                 overlap = false;
             }
@@ -265,11 +265,11 @@ fn main() {
             .unwrap();
 
         loop {
-            // let res = states_rx.recv().unwrap();
-            // dev.send(Key::S, res[0] as i32).unwrap();
-            // dev.synchronize().unwrap();
-            // dev.send(Key::T, res[1] as i32).unwrap();
-            // dev.synchronize().unwrap();
+            let res = states_rx.recv().unwrap();
+            dev.send(Key::S, res[0] as i32).unwrap();
+            dev.synchronize().unwrap();
+            dev.send(Key::T, res[1] as i32).unwrap();
+            dev.synchronize().unwrap();
         }
     });
     rtl_handle.join().unwrap();
