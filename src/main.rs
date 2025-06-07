@@ -32,7 +32,7 @@ const TMAX: f64 = BIT_TIME * 26.0;
 const NYQ: f64 = (FSPS / 2) as f64;
 
 // Backscatter Settings
-const FREQ_LOW: f64 = 400e3;
+const FREQ_LOW: f64 = 300e3;
 const FREQ_HIGH: f64 = 600e3;
 const BIT_TIME: f64 = 100e-6;
 
@@ -81,7 +81,7 @@ fn main() {
         sdr.set_tuner_gain_mode(true)
             .expect("Failed to set manual gain");
         println!("Sdr Gain Values: {:?}", sdr.get_tuner_gains().unwrap());
-        sdr.set_tuner_gain(157).expect("Invalid Gain"); // Appoximately 20 db
+        sdr.set_tuner_gain(496).expect("Invalid Gain"); // Appoximately 20 db
         sdr.reset_buffer().expect("Failed to reset buffer");
         loop {
             let data = read_samples(n, &mut sdr);
@@ -94,7 +94,7 @@ fn main() {
             Array1::zeros(REF_FREQ.len() + (SAMPLES_PER_BIT * NUM_DATA_BITS) as usize);
 
         let buffer_size = prev_buffer.len() + n;
-        let fft_size = prev_buffer.len() + n;
+        let fft_size = prev_buffer.len() + n + 99;
         let mut buffer: Array1<Complex64> = Array1::zeros(fft_size);
         let mut abs_buffer: Array1<f64> = Array1::zeros(buffer_size);
         let mut theta_clone: Array1<f64> = Array1::zeros(buffer_size);
@@ -148,8 +148,8 @@ fn main() {
             // Squelch our data
             Zip::from(&mut abs_buffer)
                 .and(&data_buffer)
-                .for_each(|x, y| *x = y.abs());
-            let threshold = abs_buffer.mean().unwrap_or_default() / 3.0;
+                .for_each(|x, y| *x = y.re * y.re + y.im * y.im);
+            let threshold = abs_buffer.mean().unwrap_or_default() / 9.0;
             Zip::from(&mut data_buffer)
                 .and(&abs_buffer)
                 .for_each(|x, y| {
@@ -208,7 +208,7 @@ fn main() {
                 .unwrap();
             let ncc_time = Instant::now();
             // Process the packet if the socre is higher than the threshold
-            if res.1 > 0.40 {
+            if res.1 > 0.70 {
                 // If our last bit is within the next samples previous buffer, we want to skip it
                 // as it could influence the correlation score. We won't miss any packets either as
                 // the backscatter device has a packet time worth delay between each packet
