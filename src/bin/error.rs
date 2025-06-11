@@ -63,7 +63,6 @@ fn main() {
     let n = (FSPS as f64 * TMAX).floor() as usize;
     let n = (n as usize / 256) * 256;
     let (samples_tx, samples_rx) = mpsc::channel();
-    let (states_tx, states_rx) = mpsc::channel();
 
     let rtl_handle = std::thread::spawn(move || {
         let mut sdr = rtlsdr::open(0).unwrap();
@@ -118,6 +117,8 @@ fn main() {
 
         let mut overlap = false;
         let mut plot = false;
+        let mut count = 0;
+        let mut correct_bits = Array1::from(vec![0, 0, 0, 1, 1, 1]);
         loop {
             // Read the samples and combine it with the previous buffer
             let samples = samples_rx.recv().unwrap();
@@ -246,31 +247,23 @@ fn main() {
                     .slice(s![bit_start..bit_end])
                     .into_shape_with_order((NUM_DATA_BITS as usize, SAMPLES_PER_BIT as usize))
                     .unwrap();
-                println!(
-                    "FFT: {} | Filter: {} | ncc: {} | Total: {}",
-                    (fft_time - start).as_micros(),
-                    (filter_time - fft_time).as_micros(),
-                    (ncc_time - filter_time).as_micros(),
-                    (ncc_time - start).as_micros(),
-                );
-                // Threshold the bit buckets themselves to transform the bucket to either 1 or 0 by
-                // choosing the larger bit value
                 let mut bits = bits.sum_axis(Axis(1));
-                bits.mapv_inplace(|x| {
-                    if x as u64 > SAMPLES_PER_BIT / 2 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                });
-                print!("Data: {} | Score: {}", bits, res.1);
-                // Choose the most prevelant bit. We have 3 bits for each bit in the data packet
-                let bits = bits.into_shape_with_order((2, 3)).unwrap();
-                let states = bits
-                    .sum_axis(Axis(1))
-                    .mapv(|x| if x >= 1.5 { 1u32 } else { 0 });
-                println!(" | Bits: {}", states);
-                states_tx.send(states).unwrap();
+                let bits = bits.mapv(|x| if x as u64 > 0 { 1 } else { 0 });
+                correct_bits.mapv_inplace(|x| x ^ 1);
+                count += 1;
+
+                if !bits.eq(&correct_bits) {
+                    println!("Failed at count: {}", count);
+                    println!("Correct Bits: {}", correct_bits);
+                    println!("Actual Bits: {}", bits);
+                    println!("Score: {}", res.1,);
+                    println!("Pos: {}", res.0);
+                    std::process::exit(0);
+                }
+                println!(
+                    "Count: {} | Data: {} | Score: {} | Position: {} | Buffer Len: {} | Prev buffer Len: {}",
+                    count, bits, res.1, res.0, buffer_size, prev_buffer_size
+                );
             } else {
                 overlap = false;
             }
@@ -278,27 +271,8 @@ fn main() {
         }
     });
 
-    let key_handle = std::thread::spawn(move || {
-        let mut dev = uinput::default()
-            .unwrap()
-            .name("backscatter-keyboard")
-            .unwrap()
-            .event(uinput::event::Keyboard::All)
-            .unwrap()
-            .create()
-            .unwrap();
-
-        loop {
-            let res = states_rx.recv().unwrap();
-            dev.send(Key::S, res[0] as i32).unwrap();
-            dev.synchronize().unwrap();
-            dev.send(Key::T, res[1] as i32).unwrap();
-            dev.synchronize().unwrap();
-        }
-    });
     rtl_handle.join().unwrap();
     process_handle.join().unwrap();
-    key_handle.join().unwrap();
 }
 
 fn bandpass(num: usize) -> Array1<Complex64> {
@@ -335,6 +309,7 @@ fn ncc(va: &ArrayView1<f64>, vb: &ArrayView1<f64>) -> f64 {
 }
 
 fn read_samples(n: usize, sdr: &mut RTLSDRDevice) -> Array1<Complex64> {
+    // sdr.reset_buffer().expect("Unable to reset buffer");
     // We need to read 2 * n samples as each sample is 2 u8
     let buf = match sdr.read_sync(n * 2) {
         Ok(val) => Array1::from(val),
