@@ -118,7 +118,11 @@ fn main() {
         let mut overlap = false;
         let mut plot = false;
         let mut count = 0;
+        let mut missing_packets = 0;
+        let mut num_bits_flipped = 0;
         let mut correct_bits = Array1::from(vec![0, 0, 0, 1, 1, 1]);
+        let mut previous_time = Instant::now();
+        let mut synchronize = true;
         loop {
             // Read the samples and combine it with the previous buffer
             let samples = samples_rx.recv().unwrap();
@@ -204,13 +208,11 @@ fn main() {
             // Slide a window through frequencies and find the highest correlation score
             let res = (0..n)
                 .into_par_iter()
-                // .step_by(SAMPLES_PER_BIT as usize / 16)
                 .filter(|&i| !(i < prev_buffer_size && overlap))
                 .map(|i| {
                     let samples = theta_buffer.slice(s![i..i + REF_FREQ.len()]);
                     let score = ncc(&samples, &REF_FREQ.view());
 
-                    // println!("Score: {}", score);
                     (i, score)
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
@@ -219,27 +221,10 @@ fn main() {
 
             // Process the packet if the socre is higher than the threshold
             if res.1 > 0.80 {
-                // if res.1 < 0.80 && !plot {
-                //     let trace = Scatter::new(
-                //         (0..(SAMPLES_PER_BIT as usize * REF_FREQ.len())).collect::<Vec<_>>(),
-                //         theta_buffer
-                //             .slice(s![res.0..(res.0 + REF_FREQ.len())])
-                //             .to_vec(),
-                //     );
-                //     let trace2 = Scatter::new(
-                //         (0..(SAMPLES_PER_BIT as usize * REF_FREQ.len())).collect::<Vec<_>>(),
-                //         REF_FREQ.to_vec(),
-                //     );
-                //     let mut plot_graph = Plot::new();
-                //     plot_graph.add_trace(trace);
-                //     plot_graph.add_trace(trace2);
-                //     plot_graph.show();
-                //     plot = true;
-                // }
                 // If our last bit is within the next samples previous buffer, we want to skip it
                 // as it could influence the correlation score. We won't miss any packets either as
                 // the backscatter device has a packet time worth delay between each packet
-                overlap = res.0 > buffer_size - 2 * prev_buffer_size;
+                overlap = res.0 >= buffer_size - 2 * prev_buffer_size;
                 // Seperates the samples into their own bit buckets
                 let bit_start = res.0 + REF_FREQ.len();
                 let bit_end = bit_start + (NUM_DATA_BITS * SAMPLES_PER_BIT) as usize;
@@ -250,20 +235,63 @@ fn main() {
                 let mut bits = bits.sum_axis(Axis(1));
                 let bits = bits.mapv(|x| if x as u64 > 0 { 1 } else { 0 });
                 correct_bits.mapv_inplace(|x| x ^ 1);
-                count += 1;
 
-                if !bits.eq(&correct_bits) {
-                    println!("Failed at count: {}", count);
-                    println!("Correct Bits: {}", correct_bits);
-                    println!("Actual Bits: {}", bits);
-                    println!("Score: {}", res.1,);
-                    println!("Pos: {}", res.0);
-                    std::process::exit(0);
+                if synchronize {
+                    if bits.eq(&correct_bits) {
+                        synchronize = false;
+                        previous_time = Instant::now();
+                    }
+                } else {
+                    let time_passed =
+                        previous_time.elapsed().as_micros() - (ncc_time - start).as_micros();
+                    if time_passed > 2500 {
+                        missing_packets += 1;
+                        println!("Failed to missing packet");
+                        println!("Failed at count: {}", count);
+                        println!("Correct Bits: {}", correct_bits);
+                        println!("Actual Bits: {}", bits);
+                        println!("Score: {}", res.1,);
+                        println!("Pos: {}", res.0);
+                        println!("Previous time elapsed: {}", time_passed);
+                        synchronize = true;
+                    } else if !bits.eq(&correct_bits) {
+                        let mut bits_flipped = 0;
+                        Zip::from(&bits).and(&correct_bits).for_each(|x, y| {
+                            if x != y {
+                                bits_flipped += 1;
+                            }
+                        });
+                        num_bits_flipped += bits_flipped;
+                        synchronize = true;
+                        println!("Failed to incorrect data");
+                        println!("Failed at count: {}", count);
+                        println!("Correct Bits: {}", correct_bits);
+                        println!("Actual Bits: {}", bits);
+                        println!("Score: {}", res.1,);
+                        println!("Pos: {}", res.0);
+                        println!("Previous time elapsed: {}", time_passed);
+                    } else {
+                        count += 1;
+                        println!(
+                            "Count: {} | Data: {} | Score: {} | Position: {} | Buffer Len: {} | Prev buffer Len: {} | {}",
+                            count,
+                            bits,
+                            res.1,
+                            res.0,
+                            buffer_size,
+                            prev_buffer_size,
+                            previous_time.elapsed().as_micros() - (ncc_time - start).as_micros()
+                        );
+                        if count >= 15000 {
+                            println!(
+                                "Bits Flipped: {} | Missing Packets: {} ",
+                                num_bits_flipped, missing_packets
+                            );
+                            std::process::exit(0);
+                        }
+                        previous_time = Instant::now();
+                    }
                 }
-                println!(
-                    "Count: {} | Data: {} | Score: {} | Position: {} | Buffer Len: {} | Prev buffer Len: {}",
-                    count, bits, res.1, res.0, buffer_size, prev_buffer_size
-                );
             } else {
                 overlap = false;
             }
