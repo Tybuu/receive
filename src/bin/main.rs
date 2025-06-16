@@ -59,9 +59,9 @@ const REF_FREQ: Lazy<Array1<f64>> = Lazy::new(|| {
 });
 
 fn main() {
-    //
     let n = (FSPS as f64 * TMAX).floor() as usize;
     let n = (n as usize / 256) * 256;
+
     let (samples_tx, samples_rx) = mpsc::channel();
     let (states_tx, states_rx) = mpsc::channel();
 
@@ -81,7 +81,7 @@ fn main() {
         sdr.set_tuner_gain_mode(true)
             .expect("Failed to set manual gain");
         println!("Sdr Gain Values: {:?}", sdr.get_tuner_gains().unwrap());
-        sdr.set_tuner_gain(496).expect("Invalid Gain"); // Appoximately 20 db
+        sdr.set_tuner_gain(496).expect("Invalid Gain"); // Max Gain
         sdr.reset_buffer().expect("Failed to reset buffer");
         loop {
             let data = read_samples(n, &mut sdr);
@@ -93,13 +93,14 @@ fn main() {
         let mut prev_buffer: Array1<Complex64> =
             Array1::zeros(REF_FREQ.len() + (SAMPLES_PER_BIT * NUM_DATA_BITS) as usize);
 
+        // Pre-allocate all the buffers to minimize allocation time through the loop
         let buffer_size = prev_buffer.len() + n;
         let fft_size = prev_buffer.len() + n;
         let mut buffer: Array1<Complex64> = Array1::zeros(fft_size);
         let mut abs_buffer: Array1<f64> = Array1::zeros(buffer_size);
         let mut theta_clone: Array1<f64> = Array1::zeros(buffer_size);
-        let mut theta_x: Array1<f64> = Array1::zeros(buffer_size);
         let mut theta_buffer: Array1<f64> = Array1::zeros(buffer_size);
+
         println!(
             "n: {}, prev: {}, total: {}",
             n,
@@ -117,7 +118,6 @@ fn main() {
         let mut ifft_scratch = vec![Complex64::ZERO; ifft.get_inplace_scratch_len()];
 
         let mut overlap = false;
-        let mut plot = false;
         let mut count = 0;
         loop {
             // Read the samples and combine it with the previous buffer
@@ -202,9 +202,12 @@ fn main() {
             let filter_time = Instant::now();
 
             // Slide a window through frequencies and find the highest correlation score
-            let res = (0..n)
+            let res = (0..(n - prev_buffer_size))
+                // Parallelizes all iterations
                 .into_par_iter()
-                // .step_by(SAMPLES_PER_BIT as usize / 16)
+                // If there's overlap from the previous read as there was a packet near the end of
+                // the buffer, we want to skip that sections to prevent from higher scores and
+                // getting false positives
                 .filter(|&i| !(i < prev_buffer_size && overlap))
                 .map(|i| {
                     let samples = theta_buffer.slice(s![i..i + REF_FREQ.len()]);
@@ -219,34 +222,11 @@ fn main() {
 
             // Process the packet if the socre is higher than the threshold
             if res.1 > 0.80 {
-                // if res.1 < 0.80 && !plot {
-                //     let trace = Scatter::new(
-                //         (0..(SAMPLES_PER_BIT as usize * REF_FREQ.len())).collect::<Vec<_>>(),
-                //         theta_buffer
-                //             .slice(s![res.0..(res.0 + REF_FREQ.len())])
-                //             .to_vec(),
-                //     );
-                //     let trace2 = Scatter::new(
-                //         (0..(SAMPLES_PER_BIT as usize * REF_FREQ.len())).collect::<Vec<_>>(),
-                //         REF_FREQ.to_vec(),
-                //     );
-                //     let mut plot_graph = Plot::new();
-                //     plot_graph.add_trace(trace);
-                //     plot_graph.add_trace(trace2);
-                //     plot_graph.show();
-                //     plot = true;
-                // }
                 // If our last bit is within the next samples previous buffer, we want to skip it
                 // as it could influence the correlation score. We won't miss any packets either as
                 // the backscatter device has a packet time worth delay between each packet
                 overlap = res.0 > buffer_size - 2 * prev_buffer_size;
-                // Seperates the samples into their own bit buckets
-                let bit_start = res.0 + REF_FREQ.len();
-                let bit_end = bit_start + (NUM_DATA_BITS * SAMPLES_PER_BIT) as usize;
-                let bits = theta_buffer
-                    .slice(s![bit_start..bit_end])
-                    .into_shape_with_order((NUM_DATA_BITS as usize, SAMPLES_PER_BIT as usize))
-                    .unwrap();
+
                 println!(
                     "FFT: {} | Filter: {} | ncc: {} | Total: {}",
                     (fft_time - start).as_micros(),
@@ -254,12 +234,22 @@ fn main() {
                     (ncc_time - filter_time).as_micros(),
                     (ncc_time - start).as_micros(),
                 );
+
+                // Seperates the samples into their own bit buckets
+                let bit_start = res.0 + REF_FREQ.len();
+                let bit_end = bit_start + (NUM_DATA_BITS * SAMPLES_PER_BIT) as usize;
+                let bits = theta_buffer
+                    .slice(s![bit_start..bit_end])
+                    .into_shape_with_order((NUM_DATA_BITS as usize, SAMPLES_PER_BIT as usize))
+                    .unwrap();
+
                 // Threshold the bit buckets themselves to transform the bucket to either 1 or 0 by
                 // choosing the larger bit value
                 let mut bits = bits.sum_axis(Axis(1));
                 bits.mapv_inplace(|x| if x as u64 > 0 { 1.0 } else { 0.0 });
                 count += 1;
                 print!("Count: {} | Data: {} | Score: {}", count, bits, res.1);
+
                 // Choose the most prevelant bit. We have 3 bits for each bit in the data packet
                 let bits = bits.into_shape_with_order((2, 3)).unwrap();
                 let states = bits
@@ -270,6 +260,8 @@ fn main() {
             } else {
                 overlap = false;
             }
+
+            // Assign the last elements from this sample so the next loop can use this data
             prev_buffer.assign(&samples.slice(s![(samples.len() - prev_buffer_size)..]));
         }
     });
@@ -286,10 +278,10 @@ fn main() {
 
         loop {
             let res = states_rx.recv().unwrap();
-            // dev.send(Key::S, res[0] as i32).unwrap();
-            // dev.synchronize().unwrap();
-            // dev.send(Key::T, res[1] as i32).unwrap();
-            // dev.synchronize().unwrap();
+            dev.send(Key::S, res[0] as i32).unwrap();
+            dev.synchronize().unwrap();
+            dev.send(Key::T, res[1] as i32).unwrap();
+            dev.synchronize().unwrap();
         }
     });
     rtl_handle.join().unwrap();
@@ -316,15 +308,6 @@ fn bandpass(num: usize) -> Array1<Complex64> {
         .collect()
 }
 
-// #[inline]
-// fn ncc(va: &ArrayView1<f64>, vb: &ArrayView1<f64>) -> f64 {
-//     let a_m = va.mean().unwrap();
-//     let va_m = va.mapv(|x| x - a_m);
-//     let b_m = vb.mean().unwrap();
-//     let vb_m = vb.mapv(|x| x - b_m);
-//     return ((va_m).dot(&vb_m) / (va_m.dot(&va_m) * vb_m.dot(&vb_m)).sqrt()).abs();
-// }
-
 #[inline]
 fn ncc(va: &ArrayView1<f64>, vb: &ArrayView1<f64>) -> f64 {
     return ((va).dot(vb) / (va.dot(va) * vb.dot(vb)).sqrt()).abs();
@@ -336,6 +319,7 @@ fn read_samples(n: usize, sdr: &mut RTLSDRDevice) -> Array1<Complex64> {
         Ok(val) => Array1::from(val),
         Err(e) => panic!("{}", e),
     };
+
     // sdr devices returns I, Q samples interleaved as u8. We create slices of each pair
     // and center them around [-1, 1]
     buf.exact_chunks(2)
